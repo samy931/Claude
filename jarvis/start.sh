@@ -26,8 +26,19 @@ if ! command -v "${JARVIS_CLAUDE_BIN:-claude}" >/dev/null 2>&1; then
   exit 1
 fi
 
-TOKEN_FILE="${JARVIS_CONFIG_DIR:-$HOME/.jarvis}/token"
+CONFIG_DIR="${JARVIS_CONFIG_DIR:-$HOME/.jarvis}"
+TOKEN_FILE="$CONFIG_DIR/token"
 python3 -c 'import server; server.logging.basicConfig(level=20); server.load_token()'
+
+KEY_FILE="$CONFIG_DIR/elevenlabs_key"
+if [ -z "${ELEVENLABS_API_KEY:-}" ] && [ ! -s "$KEY_FILE" ]; then
+  echo "ElevenLabs-API-Schluessel (elevenlabs.io > Profil > API Keys)."
+  read -rsp "Einfuegen und Enter, leer lassen fuer die macOS-Stimme: " KEY; echo
+  if [ -n "$KEY" ]; then
+    (umask 077; printf '%s\n' "$KEY" > "$KEY_FILE")
+    echo "Gespeichert in $KEY_FILE"
+  fi
+fi
 echo
 echo "URL fuer den Kurzbefehl:  http://$JARVIS_HOST:${JARVIS_PORT:-8765}/ask"
 echo "Token (Header Authorization: Bearer ...):"

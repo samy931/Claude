@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Jarvis Sprachschleife, Variante A.
+"""Jarvis Sprachschleife, Variante B (ElevenLabs).
 
 Kleiner HTTP-Server fuer den Mac. Der iPhone-Kurzbefehl schickt diktierten
-Text an POST /ask, der Server fragt Claude Code (`claude -p`) und gibt eine
-kurze, vorlesbare Antwort als reinen Text zurueck. Das iPhone liest sie mit
-"Text sprechen" vor.
+Text (oder eine Audioaufnahme) an POST /ask, der Server fragt Claude Code
+(`claude -p`) und gibt eine kurze, vorlesbare Antwort als reinen Text zurueck.
+Parallel erzeugt ElevenLabs daraus Sprache, die der Kurzbefehl mit GET /audio
+abholt und abspielt.
 
 Nur Python-Standardbibliothek, laeuft mit dem vorinstallierten python3 auf macOS.
 """
@@ -18,7 +19,11 @@ import re
 import secrets
 import subprocess
 import sys
+import tempfile
+import threading
 import time
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -33,6 +38,15 @@ SESSION_IDLE = int(os.environ.get("JARVIS_SESSION_IDLE", "600"))
 CONFIRM_TTL = int(os.environ.get("JARVIS_CONFIRM_TTL", "180"))
 MAX_SPOKEN_CHARS = 700
 MAX_BODY = 16 * 1024
+MAX_AUDIO_BODY = 15 * 1024 * 1024
+
+ELEVEN_API = os.environ.get("JARVIS_ELEVEN_API", "https://api.elevenlabs.io")
+# Standardstimme "George" (ruhig, britisch, spricht mit multilingual_v2 Deutsch).
+ELEVEN_VOICE = os.environ.get("JARVIS_VOICE_ID", "JBFqnCBsd6RMkjVDRZzb")
+ELEVEN_TTS_MODEL = os.environ.get("JARVIS_TTS_MODEL", "eleven_multilingual_v2")
+ELEVEN_STT_MODEL = os.environ.get("JARVIS_STT_MODEL", "scribe_v1")
+# Ersatzstimme von macOS, falls ElevenLabs nicht antwortet.
+MAC_VOICE = os.environ.get("JARVIS_MAC_VOICE", "Anna")
 
 # Werkzeuge ohne Folgen: duerfen immer laufen.
 READ_TOOLS = os.environ.get("JARVIS_READ_TOOLS", "Read,Grep,Glob,WebSearch,WebFetch")
@@ -188,6 +202,88 @@ class Jarvis:
 
 
 # --------------------------------------------------------------------------- #
+# ElevenLabs: Sprache zu Text und Text zu Sprache
+# --------------------------------------------------------------------------- #
+
+def eleven_key() -> str:
+    key = os.environ.get("ELEVENLABS_API_KEY", "")
+    path = CONFIG_DIR / "elevenlabs_key"
+    if not key and path.exists():
+        key = path.read_text().strip()
+    return key
+
+
+def _eleven(path: str, body: bytes, content_type: str, accept: str) -> bytes:
+    req = urllib.request.Request(f"{ELEVEN_API}{path}", data=body, method="POST", headers={
+        "xi-api-key": eleven_key(), "Content-Type": content_type, "Accept": accept})
+    try:
+        with urllib.request.urlopen(req, timeout=40) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as err:
+        detail = err.read().decode("utf-8", "replace")[:300]
+        raise RuntimeError(f"ElevenLabs {err.code}: {detail}") from None
+
+
+def eleven_tts(text: str) -> bytes:
+    body = json.dumps({"text": text, "model_id": ELEVEN_TTS_MODEL}).encode()
+    return _eleven(f"/v1/text-to-speech/{ELEVEN_VOICE}?output_format=mp3_44100_128",
+                   body, "application/json", "audio/mpeg")
+
+
+def eleven_stt(audio: bytes, content_type: str) -> str:
+    boundary = secrets.token_hex(16)
+    parts = []
+    for name, value in (("model_id", ELEVEN_STT_MODEL), ("language_code", "de")):
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"'
+                     f'\r\n\r\n{value}\r\n'.encode())
+    parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="file"; '
+                 f'filename="aufnahme.m4a"\r\nContent-Type: {content_type}\r\n\r\n'.encode())
+    body = b"".join(parts) + audio + f"\r\n--{boundary}--\r\n".encode()
+    raw = _eleven("/v1/speech-to-text", body,
+                  f"multipart/form-data; boundary={boundary}", "application/json")
+    return str(json.loads(raw).get("text", "")).strip()
+
+
+def mac_say(text: str) -> bytes:
+    """Ersatz ohne Internet: macOS-Stimme als m4a."""
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "antwort.m4a"
+        subprocess.run(["say", "-v", MAC_VOICE, "--file-format=m4af", "--data-format=aac",
+                        "-o", str(out), text], check=True, timeout=30)
+        return out.read_bytes()
+
+
+class Speaker:
+    """Erzeugt die Sprache zur letzten Antwort im Hintergrund, GET /audio holt sie ab."""
+
+    def __init__(self) -> None:
+        self._ready = threading.Event()
+        self._ready.set()
+        self._audio: tuple[bytes, str] | None = None
+
+    def prepare(self, text: str) -> None:
+        self._ready.clear()
+        self._audio = None
+        threading.Thread(target=self._render, args=(text,), daemon=True).start()
+
+    def _render(self, text: str) -> None:
+        try:
+            self._audio = (eleven_tts(text), "audio/mpeg")
+        except Exception as err:
+            log.warning("ElevenLabs nicht verfuegbar (%s), nehme macOS-Stimme", err)
+            try:
+                self._audio = (mac_say(text), "audio/mp4")
+            except Exception:
+                log.exception("Auch die macOS-Stimme ist fehlgeschlagen")
+        finally:
+            self._ready.set()
+
+    def get(self, timeout: float = 45) -> tuple[bytes, str] | None:
+        self._ready.wait(timeout)
+        return self._audio
+
+
+# --------------------------------------------------------------------------- #
 # HTTP
 # --------------------------------------------------------------------------- #
 
@@ -206,14 +302,17 @@ def load_token() -> str:
     return token
 
 
-def make_handler(jarvis: Jarvis, token: str):
-    class Handler(BaseHTTPRequestHandler):
-        server_version = "Jarvis/1"
+def make_handler(jarvis: Jarvis, token: str, speaker: Speaker | None = None):
+    speaker = speaker or Speaker()
 
-        def _reply(self, status: int, body: str) -> None:
-            raw = body.encode("utf-8")
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "Jarvis/2"
+
+        def _reply(self, status: int, body: str | bytes,
+                   content_type: str = "text/plain; charset=utf-8") -> None:
+            raw = body.encode("utf-8") if isinstance(body, str) else body
             self.send_response(status)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
             self.wfile.write(raw)
@@ -227,6 +326,15 @@ def make_handler(jarvis: Jarvis, token: str):
         def do_GET(self) -> None:
             if self.path == "/health":
                 self._reply(200, "ok")
+            elif self.path.split("?")[0] == "/audio":
+                if not self._authorized():
+                    self._reply(401, "Nicht berechtigt.")
+                    return
+                audio = speaker.get()
+                if audio is None:
+                    self._reply(503, "Keine Sprachausgabe verfügbar.")
+                else:
+                    self._reply(200, *audio)
             else:
                 self._reply(404, "Nicht gefunden.")
 
@@ -238,17 +346,24 @@ def make_handler(jarvis: Jarvis, token: str):
                 log.warning("Abgelehnt: falsches Token von %s", self.client_address[0])
                 self._reply(401, "Nicht berechtigt.")
                 return
+            ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            is_text = ctype in ("", "application/json", "text/plain",
+                                "application/x-www-form-urlencoded")
             length = int(self.headers.get("Content-Length") or 0)
-            if length <= 0 or length > MAX_BODY:
+            if length <= 0 or length > (MAX_BODY if is_text else MAX_AUDIO_BODY):
                 self._reply(400, "Ich habe nichts gehört.")
                 return
-            raw = self.rfile.read(length).decode("utf-8", "replace")
+            body = self.rfile.read(length)
             try:
-                text = str(json.loads(raw).get("text", ""))
-            except (ValueError, AttributeError):
-                text = raw  # Kurzbefehl kann auch reinen Text senden
-            log.info("Frage: %s", text)
-            try:
+                if is_text:
+                    raw = body.decode("utf-8", "replace")
+                    try:
+                        text = str(json.loads(raw).get("text", ""))
+                    except (ValueError, AttributeError):
+                        text = raw  # Kurzbefehl kann auch reinen Text senden
+                else:
+                    text = eleven_stt(body, ctype or "audio/mp4")
+                log.info("Frage: %s", text)
                 answer = jarvis.handle(text)
             except subprocess.TimeoutExpired:
                 answer = "Das dauert gerade zu lange. Frag mich bitte gleich noch einmal."
@@ -256,6 +371,7 @@ def make_handler(jarvis: Jarvis, token: str):
                 log.exception("Fehler bei der Verarbeitung")
                 answer = "Entschuldige, da ist etwas schiefgegangen."
             log.info("Antwort: %s", answer)
+            speaker.prepare(answer)
             self._reply(200, answer)
 
         def log_message(self, fmt: str, *args) -> None:
@@ -264,9 +380,23 @@ def make_handler(jarvis: Jarvis, token: str):
     return Handler
 
 
+def list_voices() -> None:
+    req = urllib.request.Request(f"{ELEVEN_API}/v1/voices", headers={"xi-api-key": eleven_key()})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        voices = json.load(resp).get("voices", [])
+    for v in voices:
+        labels = ", ".join(str(x) for x in (v.get("labels") or {}).values())
+        print(f"{v.get('voice_id')}  {v.get('name')}  ({labels})")
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s",
                         datefmt="%H:%M:%S")
+    if "--voices" in sys.argv:
+        list_voices()
+        return
+    if not eleven_key():
+        log.warning("Kein ElevenLabs-Schluessel gefunden, es spricht die macOS-Stimme.")
     if not HOST:
         sys.exit("JARVIS_HOST fehlt. Bitte ueber start.sh starten "
                  "(nimmt automatisch die Tailscale-Adresse).")
